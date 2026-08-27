@@ -33,6 +33,245 @@ static XrResult (*p_xrConvertTimeToTimespecTimeKHR)(XrInstance, XrTime, struct t
 
 struct openxr_instance_funcs g_xr_host_instance_dispatch_table;
 
+static BOOL vulkan_instance_has_extension(
+    const struct vulkan_instance *instance,
+    const char *name,
+    size_t len)
+{
+#define USE_VK_EXT(x)                       \
+  if (len == sizeof(#x) - 1 &&              \
+    !memcmp(name, #x, sizeof(#x) - 1))      \
+    return instance->extensions.has_ ## x;
+
+  ALL_VK_INSTANCE_EXTS
+
+#undef USE_VK_EXT
+
+  return FALSE;
+}
+
+
+static BOOL vulkan_device_has_extension(
+    const struct vulkan_device *device,
+    const char *name,
+    size_t len)
+{
+#define USE_VK_EXT(x)                   \
+  if (len == sizeof(#x) - 1 &&          \
+    !memcmp(name, #x, sizeof(#x) - 1))  \
+    return device->extensions.has_ ## x;
+
+  ALL_VK_DEVICE_EXTS
+
+#undef USE_VK_EXT
+
+  return FALSE;
+}
+
+static BOOL check_instance_extensions(
+    const struct vulkan_instance *instance,
+    const char *required)
+{
+  const char *start;
+  const char *p = required;
+  BOOL compatible = TRUE;
+  size_t len;
+
+  while (*p)
+  {
+    while (*p == ' ')
+      p++;
+
+    if (!*p)
+      break;
+
+    start = p;
+
+    while (*p && *p != ' ')
+      p++;
+
+    len = p - start;
+
+    if (!vulkan_instance_has_extension(
+            instance, start, len))
+    {
+      WARN("Missing runtime-required Vulkan instance extension: %.*s\n",
+            (int)len, start);
+
+      compatible = FALSE;
+    }
+    else
+    {
+      TRACE("Runtime-required Vulkan instance extension is enabled: %.*s\n",
+            (int)len, start);
+    }
+  }
+
+  return compatible;
+}
+
+static BOOL check_device_extensions(
+    const struct vulkan_device *device,
+    const char *required)
+{
+  const char *start;
+  const char *p = required;
+  BOOL compatible = TRUE;
+  size_t len;
+
+  while (*p)
+  {
+    while (*p == ' ')
+      p++;
+
+    if (!*p)
+      break;
+
+    start = p;
+
+    while (*p && *p != ' ')
+      p++;
+
+    len = p - start;
+
+    if (!vulkan_device_has_extension(
+            device, start, len))
+    {
+      WARN("Missing runtime-required Vulkan device extension: %.*s\n",
+            (int)len, start);
+
+      compatible = FALSE;
+    }
+    else
+    {
+      TRACE("Runtime-required Vulkan device extension is enabled: %.*s\n",
+            (int)len, start);
+    }
+  }
+
+  return compatible;
+}
+
+static XrResult check_vulkan_requirements(
+    wine_XrInstance *wine_instance,
+    const XrGraphicsBindingVulkanKHR *binding,
+    BOOL *compatible)
+{
+  struct vulkan_instance *vk_instance;
+  struct vulkan_device *vk_device;
+  XrGraphicsRequirementsVulkanKHR requirements =
+  {
+      .type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR,
+  };
+  char *instance_extensions = NULL;
+  char *device_extensions = NULL;
+  BOOL instance_ok, device_ok;
+  uint32_t len;
+  XrResult res;
+
+  *compatible = FALSE;
+
+  vk_instance =
+      vulkan_instance_from_handle(binding->instance);
+
+  vk_device =
+      vulkan_device_from_handle(binding->device);
+
+  res =
+      g_xr_host_instance_dispatch_table
+          .p_xrGetVulkanGraphicsRequirementsKHR(
+              wine_instance->host_instance,
+              wine_instance->systemId,
+              &requirements);
+
+  if (res != XR_SUCCESS)
+      goto done;
+
+  res =
+      g_xr_host_instance_dispatch_table
+          .p_xrGetVulkanInstanceExtensionsKHR(
+              wine_instance->host_instance,
+              wine_instance->systemId,
+              0,
+              &len,
+              NULL);
+
+  if (res != XR_SUCCESS)
+      goto done;
+
+  if (!(instance_extensions = malloc(len)))
+  {
+      res = XR_ERROR_OUT_OF_MEMORY;
+      goto done;
+  }
+
+  res =
+      g_xr_host_instance_dispatch_table
+          .p_xrGetVulkanInstanceExtensionsKHR(
+              wine_instance->host_instance,
+              wine_instance->systemId,
+              len,
+              &len,
+              instance_extensions);
+
+  if (res != XR_SUCCESS)
+      goto done;
+
+  res =
+      g_xr_host_instance_dispatch_table
+          .p_xrGetVulkanDeviceExtensionsKHR(
+              wine_instance->host_instance,
+              wine_instance->systemId,
+              0,
+              &len,
+              NULL);
+
+  if (res != XR_SUCCESS)
+      goto done;
+
+  if (!(device_extensions = malloc(len)))
+  {
+      res = XR_ERROR_OUT_OF_MEMORY;
+      goto done;
+  }
+
+  res =
+      g_xr_host_instance_dispatch_table
+          .p_xrGetVulkanDeviceExtensionsKHR(
+              wine_instance->host_instance,
+              wine_instance->systemId,
+              len,
+              &len,
+              device_extensions);
+
+  if (res != XR_SUCCESS)
+      goto done;
+
+  TRACE("Runtime Vulkan instance requirements: %s\n",
+        instance_extensions);
+
+  TRACE("Runtime Vulkan device requirements: %s\n",
+        device_extensions);
+
+  instance_ok =
+      check_instance_extensions(
+          vk_instance,
+          instance_extensions);
+
+  device_ok =
+      check_device_extensions(
+          vk_device,
+          device_extensions);
+
+  *compatible = instance_ok && device_ok;
+
+done:
+    free(instance_extensions);
+    free(device_extensions);
+
+    return res;
+}
+
 XrResult WINAPI wine_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *instance) {
   XrResult res;
   uint32_t i, j, count = 0;
@@ -110,8 +349,33 @@ XrResult WINAPI wine_xrCreateSession(XrInstance instance, const XrSessionCreateI
       case XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR /* == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR */: {
         const XrGraphicsBindingVulkanKHR *their_vk_binding = (const XrGraphicsBindingVulkanKHR *)createInfo->next;
 
+        BOOL compatible;
+
+        res = check_vulkan_requirements(
+          wine_instance,
+          their_vk_binding,
+          &compatible);
+
+        if (res != XR_SUCCESS)
+        {
+          WARN("Failed to query Vulkan requirements: %d\n", res);
+          return res;
+        }
+
+        if (!compatible)
+        {
+          WARN("Existing Vulkan device does not satisfy "
+              "the OpenXR runtime requirements.\n");
+
+          return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+        }
+        else
+        {
+          WARN("Existing Vulkan instance/device satisfies all "
+              "OpenXR runtime requirements.\n");
+        }
+
         our_vk_binding = *their_vk_binding;
-        our_vk_binding.instance = vulkan_instance_from_handle(their_vk_binding->instance)->host.instance;
         our_vk_binding.physicalDevice = vulkan_physical_device_from_handle(their_vk_binding->physicalDevice)->host.physical_device;
         our_vk_binding.device = vulkan_device_from_handle(their_vk_binding->device)->host.device;
 

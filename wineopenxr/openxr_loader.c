@@ -12,6 +12,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(openxr);
 static uint32_t g_physdev_vid, g_physdev_pid;
 static char *g_instance_extensions, *g_device_extensions;
 static XrVersion api_version = XR_CURRENT_API_VERSION;
+static SRWLOCK requirements_lock = SRWLOCK_INIT;
 
 #define SESSION_TYPE_VULKAN 1
 #define SESSION_TYPE_OPENGL 2
@@ -98,108 +99,6 @@ static void parse_extensions(const char *in, uint32_t *out_count, char ***out_st
   *out_strs = list;
 }
 
-static BOOL get_vulkan_extensions(void) {
-  /* Linux SteamVR's xrCreateInstance will hang forever if SteamVR hasn't
-   * already been launched by the user.  Since that's the only way to tell if
-   * OpenXR is functioning, let's use OpenVR to tell whether SteamVR is
-   * functioning before calling xrCreateInstance.
-   *
-   * This should be removed when SteamVR's bug is fixed. */
-  DWORD type, value, wait_status = 0, size;
-  LSTATUS status;
-  HANDLE event;
-  HKEY vr_key;
-
-  if ((status = RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_READ, &vr_key))) {
-    ERR("Could not create key, status %#x.\n", status);
-    return FALSE;
-  }
-
-  size = sizeof(value);
-  if ((status = RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&value, &size))) {
-    ERR("Could not query value, status %#x.\n", status);
-    RegCloseKey(vr_key);
-    return FALSE;
-  }
-  if (type != REG_DWORD) {
-    ERR("Unexpected value type %#x.\n", type);
-    RegCloseKey(vr_key);
-    return FALSE;
-  }
-
-  if (value) {
-    goto done;
-  }
-
-  event = CreateEventA(NULL, FALSE, FALSE, NULL);
-  while (1) {
-    if (RegNotifyChangeKeyValue(vr_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, event, TRUE)) {
-      ERR("Error registering registry change notification.\n");
-      CloseHandle(event);
-      goto done;
-    }
-    size = sizeof(value);
-    if ((status = RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&value, &size))) {
-      ERR("Could not query value, status %#x.\n", status);
-      CloseHandle(event);
-      goto done;
-    }
-    if (value) {
-      break;
-    }
-    while ((wait_status = WaitForSingleObject(event, 1000)) == WAIT_TIMEOUT) {
-      ERR("VR state wait timeout.\n");
-    }
-
-    if (wait_status != WAIT_OBJECT_0) {
-      ERR("Got unexpected wait status %#x.\n", wait_status);
-      break;
-    }
-  }
-  CloseHandle(event);
-
-done:
-  if (value == 1) {
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_instance_extensions", NULL, &type, NULL, &size))) {
-      ERR("Error getting openxr_vulkan_instance_extensions, status %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-    g_instance_extensions = malloc(size);
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_instance_extensions", NULL, &type,
-                                   (BYTE *)g_instance_extensions, &size))) {
-      ERR("Error getting openxr_vulkan_instance_extensions, status %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_device_extensions", NULL, &type, NULL, &size))) {
-      ERR("Error getting openxr_vulkan_device_extensions, status %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-    g_device_extensions = malloc(size);
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_device_extensions", NULL, &type, (BYTE *)g_device_extensions,
-                                   &size))) {
-      ERR("Error getting openxr_vulkan_device_extensions, status %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_device_vid", NULL, &type, (BYTE *)&g_physdev_vid, &size))) {
-      ERR("Error getting openxr_vulkan_device_vid, status: %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-    if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_device_pid", NULL, &type, (BYTE *)&g_physdev_pid, &size))) {
-      ERR("Error getting openxr_vulkan_device_pid, status: %#x.\n", status);
-      RegCloseKey(vr_key);
-      return FALSE;
-    }
-  }
-
-  RegCloseKey(vr_key);
-  return value == 1;
-}
-
 static BOOL WINAPI wine_openxr_unix_init(INIT_ONCE *once, void *param, void **context) {
   struct init_openxr_params params = {.winevulkan = LoadLibraryA("winevulkan.dll")};
   if (__wine_init_unix_call() || UNIX_CALL(init, &params)) {
@@ -217,244 +116,237 @@ static BOOL wine_openxr_unix_init_once(void) {
 }
 
 static XrResult wine_openxr_init_once(void) {
-  if (g_instance_extensions || g_device_extensions) {
-    /* already done */
-    return XR_SUCCESS;
-  }
-
   if (!wine_openxr_unix_init_once()) {
     return XR_ERROR_INITIALIZATION_FAILED;
   }
 
-  if (!get_vulkan_extensions()) {
-    return XR_ERROR_INITIALIZATION_FAILED;
-  }
-
-  TRACE("g_device_extensions %s.\n", g_device_extensions);
-  __wine_set_unix_env(WINE_VULKAN_DEVICE_VARIABLE, g_device_extensions);
   return XR_SUCCESS;
 }
 
-static int get_extensions(char **ret_instance_extensions, char **ret_device_extensions,
-                          uint32_t *ret_physdev_vid, uint32_t *ret_physdev_pid) {
-  PFN_xrGetVulkanInstanceExtensionsKHR pxrGetVulkanInstanceExtensionsKHR;
-  PFN_xrGetSystem pxrGetSystem;
-  PFN_xrGetVulkanGraphicsDeviceKHR pxrGetVulkanGraphicsDeviceKHR;
-  PFN_xrGetVulkanGraphicsRequirementsKHR pxrGetVulkanGraphicsRequirementsKHR;
-  PFN_xrGetInstanceProperties pxrGetInstanceProperties;
-  PFN_xrEnumerateViewConfigurations pxrEnumerateViewConfigurations;
-  char *instance_extensions, *device_extensions;
+static XrResult get_extensions(
+    XrInstance instance,
+    XrSystemId system,
+    char **ret_instance_extensions,
+    char **ret_device_extensions,
+    uint32_t *ret_physdev_vid,
+    uint32_t *ret_physdev_pid)
+{
+  char *instance_extensions = NULL;
+  char *device_extensions = NULL;
   uint32_t len, i;
-  XrInstance instance;
-  XrSystemId system;
   XrResult res;
-  VkInstance vk_instance;
   VkResult vk_res;
+  VkInstance vk_instance = VK_NULL_HANDLE;
   VkPhysicalDevice vk_physdev;
   VkPhysicalDeviceProperties vk_dev_props;
   struct xrGetVulkanDeviceExtensionsKHR_params params;
   NTSTATUS status;
 
-  static const char *xr_extensions[] = {
-      "XR_KHR_vulkan_enable",
-  };
-
-  XrInstanceCreateInfo xrCreateInfo = {
-      .type = XR_TYPE_INSTANCE_CREATE_INFO,
-      .next = NULL,
-      .createFlags = 0,
-      .applicationInfo =
-          {
-              .applicationVersion = 0,
-              .engineVersion = 0,
-              .apiVersion = api_version,
-          },
-      .enabledApiLayerCount = 0,
-      .enabledApiLayerNames = NULL,
-      .enabledExtensionCount = ARRAY_SIZE(xr_extensions),
-      .enabledExtensionNames = xr_extensions,
-  };
-  XrInstanceProperties inst_props = {
-      .type = XR_TYPE_INSTANCE_PROPERTIES,
-  };
-  XrSystemGetInfo system_info = {
-      .type = XR_TYPE_SYSTEM_GET_INFO,
-      .formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY,
-  };
-  XrGraphicsRequirementsVulkanKHR reqs = {
+  XrGraphicsRequirementsVulkanKHR reqs =
+  {
       .type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR,
   };
-  VkApplicationInfo vk_appinfo = {
+
+  VkApplicationInfo vk_appinfo =
+  {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-      .pNext = NULL,
-      .pApplicationName = "wineopenxr test instance",
+      .pApplicationName = "wineopenxr requirements",
       .applicationVersion = 0,
-      .pEngineName = "wineopenxr test instance",
-      .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-      .apiVersion = VK_MAKE_VERSION(1, 1, 0),
+      .pEngineName = "wineopenxr",
+      .engineVersion = 0,
+      .apiVersion = VK_API_VERSION_1_1,
   };
-  VkInstanceCreateInfo vk_createinfo = {
+
+  VkInstanceCreateInfo vk_createinfo =
+  {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-      .pNext = NULL,
-      .flags = 0,
       .pApplicationInfo = &vk_appinfo,
-      .enabledLayerCount = 0,
-      .ppEnabledLayerNames = NULL,
-      .enabledExtensionCount = 0,
-      .ppEnabledExtensionNames = NULL,
   };
-  XrViewConfigurationType *configs;
 
-  if (!wine_openxr_unix_init_once()) {
-    WARN("unixlib initialization failed.\n");
-    return XR_ERROR_INITIALIZATION_FAILED;
+  /*
+    * Preserve the Vulkan initialization sequence expected by
+    * SteamVR.
+    */
+  res = xrGetVulkanGraphicsRequirementsKHR(
+      instance, system, &reqs);
+
+  if (res != XR_SUCCESS)
+  {
+      WARN("xrGetVulkanGraphicsRequirementsKHR failed: %d\n", res);
+      goto done;
   }
 
-  strcpy(xrCreateInfo.applicationInfo.applicationName, "wineopenxr test instance");
-  strcpy(xrCreateInfo.applicationInfo.engineName, "wineopenxr test instance");
+  res = xrGetVulkanInstanceExtensionsKHR(
+      instance, system, 0, &len, NULL);
 
-  res = xrCreateInstance(&xrCreateInfo, &instance);
-  if (res == XR_ERROR_API_VERSION_UNSUPPORTED) {
-    WARN("version %#lx unsupported.\n", (long)api_version);
-    api_version = XR_MAKE_VERSION(1, 0, 0);
-    xrCreateInfo.applicationInfo.apiVersion = api_version;
-    res = xrCreateInstance(&xrCreateInfo, &instance);
-  }
-  if (res != XR_SUCCESS) {
-    WARN("xrCreateInstance failed: %d\n", res);
-    return res;
+  if (res != XR_SUCCESS)
+  {
+      WARN("xrGetVulkanInstanceExtensionsKHR failed: %d\n", res);
+      goto done;
   }
 
-  xrGetInstanceProcAddr(instance, "xrGetVulkanInstanceExtensionsKHR",
-                        (PFN_xrVoidFunction *)&pxrGetVulkanInstanceExtensionsKHR);
-  xrGetInstanceProcAddr(instance, "xrGetSystem", (PFN_xrVoidFunction *)&pxrGetSystem);
-  xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction *)&pxrGetVulkanGraphicsDeviceKHR);
-  xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirementsKHR",
-                        (PFN_xrVoidFunction *)&pxrGetVulkanGraphicsRequirementsKHR);
-  xrGetInstanceProcAddr(instance, "xrGetInstanceProperties", (PFN_xrVoidFunction *)&pxrGetInstanceProperties);
-  xrGetInstanceProcAddr(instance, "xrEnumerateViewConfigurations",
-                        (PFN_xrVoidFunction *)&pxrEnumerateViewConfigurations);
-
-  res = pxrGetInstanceProperties(instance, &inst_props);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetInstanceProperties failed: %d\n", res);
+  if (!(instance_extensions = malloc(len)))
+  {
+      res = XR_ERROR_OUT_OF_MEMORY;
+      goto done;
   }
 
-  res = pxrGetSystem(instance, &system_info, &system);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetSystem failed: %d\n", res);
-    xrDestroyInstance(instance);
-    return res;
+  res = xrGetVulkanInstanceExtensionsKHR(
+      instance, system, len, &len, instance_extensions);
+
+  if (res != XR_SUCCESS)
+  {
+      WARN("xrGetVulkanInstanceExtensionsKHR failed: %d\n", res);
+      goto done;
   }
 
-  res = pxrEnumerateViewConfigurations(instance, system, 0, &len, NULL);
-  if (res != XR_SUCCESS) {
-    WARN("xrEnumerateViewConfigurations failed: %d\n", res);
-  }
-  configs = malloc(len * sizeof(*configs));
-  res = pxrEnumerateViewConfigurations(instance, system, len, &len, configs);
-  if (res != XR_SUCCESS) {
-    WARN("xrEnumerateViewConfigurations failed: %d\n", res);
-  }
-  free(configs);
+  parse_extensions(
+      instance_extensions,
+      &vk_createinfo.enabledExtensionCount,
+      (char ***)&vk_createinfo.ppEnabledExtensionNames);
 
-  res = pxrGetVulkanGraphicsRequirementsKHR(instance, system, &reqs);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetVulkanGraphicsRequirementsKHR failed: %d\n", res);
-  }
+  vk_res = vkCreateInstance(
+      &vk_createinfo,
+      NULL,
+      &vk_instance);
 
-  res = pxrGetVulkanInstanceExtensionsKHR(instance, system, 0, &len, NULL);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetVulkanInstanceExtensionsKHR failed: %d\n", res);
-    xrDestroyInstance(instance);
-    return res;
-  }
-  instance_extensions = malloc(len);
-  res = pxrGetVulkanInstanceExtensionsKHR(instance, system, len, &len, instance_extensions);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetVulkanInstanceExtensionsKHR failed: %d\n", res);
-    xrDestroyInstance(instance);
-    free(instance_extensions);
-    return res;
-  }
-
-  parse_extensions(instance_extensions, &vk_createinfo.enabledExtensionCount,
-                   (char ***)&vk_createinfo.ppEnabledExtensionNames);
-
-  vk_res = vkCreateInstance(&vk_createinfo, NULL, &vk_instance);
-  if (vk_res != VK_SUCCESS) {
-    WARN("vkCreateInstance failed: %d\n", vk_res);
-    for (i = 0; i < vk_createinfo.enabledExtensionCount; ++i) {
+  for (i = 0; i < vk_createinfo.enabledExtensionCount; i++)
       free((void *)vk_createinfo.ppEnabledExtensionNames[i]);
-    }
-    free((void *)vk_createinfo.ppEnabledExtensionNames);
-    xrDestroyInstance(instance);
-    free(instance_extensions);
-    return XR_ERROR_INITIALIZATION_FAILED;
-  }
 
-  for (i = 0; i < vk_createinfo.enabledExtensionCount; ++i) {
-    free((void *)vk_createinfo.ppEnabledExtensionNames[i]);
-  }
   free((void *)vk_createinfo.ppEnabledExtensionNames);
+  vk_createinfo.ppEnabledExtensionNames = NULL;
 
-  res = pxrGetVulkanGraphicsDeviceKHR(instance, system, vk_instance, &vk_physdev);
-  if (res != XR_SUCCESS) {
-    WARN("xrGetVulkanGraphicsDeviceKHR failed: %d\n", res);
-    vkDestroyInstance(vk_instance, NULL);
-    xrDestroyInstance(instance);
-    free(instance_extensions);
-    return res;
+  if (vk_res != VK_SUCCESS)
+  {
+      WARN("vkCreateInstance failed: %d\n", vk_res);
+      res = XR_ERROR_INITIALIZATION_FAILED;
+      goto done;
   }
 
-  vkGetPhysicalDeviceProperties(vk_physdev, &vk_dev_props);
+  res = xrGetVulkanGraphicsDeviceKHR(
+      instance,
+      system,
+      vk_instance,
+      &vk_physdev);
+
+  if (res != XR_SUCCESS)
+  {
+      WARN("xrGetVulkanGraphicsDeviceKHR failed: %d\n", res);
+      goto done;
+  }
+
+  vkGetPhysicalDeviceProperties(
+      vk_physdev,
+      &vk_dev_props);
+
   *ret_physdev_vid = vk_dev_props.vendorID;
   *ret_physdev_pid = vk_dev_props.deviceID;
 
-  /* Call Unix thunk directly to get the real host extensions list */
+  /*
+    * Call the Unix thunk directly because we want the native
+    * Linux extension names here, not VK_WINE_openxr_device_extensions.
+    */
   params.instance = instance;
   params.systemId = system;
   params.bufferCapacityInput = 0;
   params.bufferCountOutput = &len;
   params.buffer = NULL;
-  status = UNIX_CALL(xrGetVulkanDeviceExtensionsKHR, &params);
-  assert(!status && "xrGetVulkanDeviceExtensionsKHR");
-  res = params.result;
 
-  if (res != XR_SUCCESS) {
-    WARN("pxrGetVulkanDeviceExtensionsKHR fail: %d\n", res);
-    vkDestroyInstance(vk_instance, NULL);
-    xrDestroyInstance(instance);
-    free(instance_extensions);
-    return res;
+  status = UNIX_CALL(
+      xrGetVulkanDeviceExtensionsKHR,
+      &params);
+
+  assert(!status && "xrGetVulkanDeviceExtensionsKHR");
+
+  res = params.result;
+  if (res != XR_SUCCESS)
+      goto done;
+
+  if (!(device_extensions = malloc(len)))
+  {
+      res = XR_ERROR_OUT_OF_MEMORY;
+      goto done;
   }
-  device_extensions = malloc(len);
 
   params.bufferCapacityInput = len;
   params.buffer = device_extensions;
-  status = UNIX_CALL(xrGetVulkanDeviceExtensionsKHR, &params);
+
+  status = UNIX_CALL(
+      xrGetVulkanDeviceExtensionsKHR,
+      &params);
+
   assert(!status && "xrGetVulkanDeviceExtensionsKHR");
+
   res = params.result;
+  if (res != XR_SUCCESS)
+      goto done;
 
-  if (res != XR_SUCCESS) {
-    WARN("pxrGetVulkanDeviceExtensionsKHR fail: %d\n", res);
-    vkDestroyInstance(vk_instance, NULL);
-    xrDestroyInstance(instance);
-    free(instance_extensions);
-    free(device_extensions);
-    return res;
-  }
-
-  vkDestroyInstance(vk_instance, NULL);
-  xrDestroyInstance(instance);
-
-  TRACE("Got required instance extensions: %s\n", instance_extensions);
-  TRACE("Got required device extensions: %s\n", device_extensions);
+  TRACE("Required Vulkan instance extensions: %s\n",
+        instance_extensions);
+  TRACE("Required Vulkan device extensions: %s\n",
+        device_extensions);
 
   *ret_instance_extensions = instance_extensions;
   *ret_device_extensions = device_extensions;
 
-  return XR_SUCCESS;
+  instance_extensions = NULL;
+  device_extensions = NULL;
+
+done:
+  if (vk_instance)
+      vkDestroyInstance(vk_instance, NULL);
+
+  free(instance_extensions);
+  free(device_extensions);
+
+  return res;
+}
+
+static XrResult ensure_vulkan_requirements(
+    XrInstance instance,
+    XrSystemId system)
+{
+  char *instance_extensions = NULL;
+  char *device_extensions = NULL;
+  uint32_t vid, pid;
+  XrResult res;
+
+  AcquireSRWLockExclusive(&requirements_lock);
+
+  if (g_instance_extensions && g_device_extensions)
+  {
+      ReleaseSRWLockExclusive(&requirements_lock);
+      return XR_SUCCESS;
+  }
+
+  res = get_extensions(
+      instance,
+      system,
+      &instance_extensions,
+      &device_extensions,
+      &vid,
+      &pid);
+
+  if (res == XR_SUCCESS)
+  {
+      g_instance_extensions = instance_extensions;
+      g_device_extensions = device_extensions;
+      g_physdev_vid = vid;
+      g_physdev_pid = pid;
+
+      /*
+        * This is the host device extension list which WineVulkan
+        * substitutes when a future device enables
+        * VK_WINE_openxr_device_extensions.
+        */
+      __wine_set_unix_env(
+          WINE_VULKAN_DEVICE_VARIABLE,
+          g_device_extensions);
+  }
+
+  ReleaseSRWLockExclusive(&requirements_lock);
+
+  return res;
 }
 
 XrResult WINAPI xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *instance) {
@@ -1677,8 +1569,17 @@ XrResult WINAPI xrGetD3D11GraphicsRequirementsKHR(XrInstance instance,
   DXGI_ADAPTER_DESC adapter_desc;
   HRESULT hr;
   DWORD i;
+  XrResult res;
 
   TRACE("\n");
+
+  res = ensure_vulkan_requirements(
+    instance,
+    systemId);
+
+  if (res != XR_SUCCESS)
+      return res;
+
 
   hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
   if (FAILED(hr)) {
@@ -1932,79 +1833,39 @@ XrResult WINAPI xrGetVulkanDeviceExtensionsKHR(XrInstance instance, XrSystemId s
 
 /* wineopenxr API */
 XrResult WINAPI __wineopenxr_GetVulkanInstanceExtensions(uint32_t buflen, uint32_t *outlen, char *buf) {
-  XrResult res;
-
   TRACE("\n");
 
-  if ((res = wine_openxr_init_once()) != XR_SUCCESS) {
-    TRACE("could not initialize openxr: %d\n", res);
-    return res;
-  }
+  if (!g_device_extensions)
+      return XR_ERROR_INITIALIZATION_FAILED;
 
-  if (buflen < strlen(g_instance_extensions) + 1 || !buf) {
-    *outlen = strlen(g_instance_extensions) + 1;
-    return XR_SUCCESS;
-  }
+  *outlen = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
 
-  *outlen = strlen(g_instance_extensions) + 1;
-  strcpy(buf, g_instance_extensions);
+  if (!buf || buflen < *outlen)
+      return XR_SUCCESS;
 
+  strcpy(buf, WINE_VULKAN_DEVICE_EXTENSION_NAME);
   return XR_SUCCESS;
 }
 
 /* wineopenxr API */
 XrResult WINAPI __wineopenxr_GetVulkanDeviceExtensions(uint32_t buflen, uint32_t *outlen, char *buf) {
-  XrResult res;
-
   TRACE("\n");
 
-  if ((res = wine_openxr_init_once()) != XR_SUCCESS) {
-    TRACE("could not initialize openxr: %d\n", res);
-    return res;
+  if (!g_device_extensions)
+  {
+      TRACE("OpenXR Vulkan device requirements are not available yet.\n");
+      return XR_ERROR_INITIALIZATION_FAILED;
   }
 
-  if (buflen < strlen(WINE_VULKAN_DEVICE_EXTENSION_NAME) + 1 || !buf) {
-    *outlen = strlen(WINE_VULKAN_DEVICE_EXTENSION_NAME) + 1;
-    return XR_SUCCESS;
-  }
+  *outlen = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
 
-  *outlen = strlen(WINE_VULKAN_DEVICE_EXTENSION_NAME) + 1;
-  strcpy(buf, WINE_VULKAN_DEVICE_EXTENSION_NAME);
+  if (!buf || buflen < *outlen)
+      return XR_SUCCESS;
+
+  memcpy(
+      buf,
+      WINE_VULKAN_DEVICE_EXTENSION_NAME,
+      sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME));
 
   return XR_SUCCESS;
-}
-
-BOOL CDECL wineopenxr_init_registry(void)
-{
-    char *xr_inst_ext, *xr_dev_ext;
-    uint32_t vid, pid;
-    LSTATUS status;
-    HKEY vr_key;
-
-    if ((status = RegOpenKeyExA( HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_ALL_ACCESS, &vr_key )))
-    {
-        WARN( "Could not open key, status %#x.\n", status );
-        return FALSE;
-    }
-
-    if (!get_extensions( &xr_inst_ext, &xr_dev_ext, &vid, &pid ))
-    {
-        TRACE( "Got XR extensions.\n" );
-        if ((status = RegSetValueExA( vr_key, "openxr_vulkan_instance_extensions", 0, REG_SZ,
-                                      (BYTE *)xr_inst_ext, strlen( xr_inst_ext ) + 1 )))
-            ERR( "Could not set openxr_vulkan_instance_extensions value, status %#x.\n", status );
-        if ((status = RegSetValueExA( vr_key, "openxr_vulkan_device_extensions", 0, REG_SZ,
-                                      (BYTE *)xr_dev_ext, strlen( xr_dev_ext ) + 1 )))
-            ERR( "Could not set openxr_vulkan_device_extensions value, status %#x.\n", status );
-        if ((status = RegSetValueExA( vr_key, "openxr_vulkan_device_vid", 0, REG_DWORD,
-                                      (BYTE *)&vid, sizeof(vid) )))
-            ERR( "Could not set openxr_vulkan_device_vid value, status %#x.\n", status );
-        if ((status = RegSetValueExA( vr_key, "openxr_vulkan_device_pid", 0, REG_DWORD,
-                                      (BYTE *)&pid, sizeof(pid) )))
-            ERR( "Could not set openxr_vulkan_device_pid value, status %#x.\n", status );
-    }
-
-    TRACE( "Initialized OpenXR registry entries\n" );
-    RegCloseKey( vr_key );
-    return TRUE;
 }

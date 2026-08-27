@@ -66,91 +66,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
     return TRUE;
 }
 
-static BOOL get_vulkan_extensions_from_registry(void)
-{
-    DWORD type, value, size = sizeof(value), wait_result;
-    LSTATUS status;
-    HANDLE event;
-    HKEY vr_key;
-    DWORD len;
-
-    if ((status = RegOpenKeyExA( HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_READ, &vr_key )))
-    {
-        ERR( "Could not create key, status %#lx.\n", status );
-        return FALSE;
-    }
-
-    if ((status = RegQueryValueExA( vr_key, "state", NULL, &type, (BYTE *)&value, &size )))
-    {
-        ERR( "Could not query VR state, status %#lx\n", status );
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-    if (type != REG_DWORD)
-    {
-        ERR( "Invalid VR state type: %lx\n", type );
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-
-    if (!value)
-    {
-        event = CreateEventA( NULL, FALSE, FALSE, NULL );
-        while (1)
-        {
-            if (RegNotifyChangeKeyValue( vr_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, event, TRUE ))
-            {
-                ERR( "Error registering VR key change notification" );
-                break;
-            }
-            size = sizeof(value);
-            if ((status = RegQueryValueExA( vr_key, "state", NULL, &type, (BYTE *)&value, &size )))
-            {
-                ERR( "Couild not query VR state, status %#lx\n", status );
-                break;
-            }
-            if (value) break;
-            while ((wait_result = WaitForSingleObject( event, 1000 )) == WAIT_TIMEOUT)
-                WARN( "Waiting for VR to become ready\n" );
-
-            if (wait_result != WAIT_OBJECT_0)
-            {
-                ERR( "Wait for VR state change failed\n" );
-                break;
-            }
-        }
-        CloseHandle( event );
-    }
-
-    if (value != 1)
-    {
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-    if ((status = RegQueryValueExA( vr_key, "openvr_vulkan_instance_extensions", NULL, &type, NULL, &len )))
-    {
-        ERR( "Could not query openvr vulkan instance extensions, status %#lx\n", status );
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-    if (!(g_instance_extensions = malloc(len)))
-    {
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-
-    if ((status = RegQueryValueExA( vr_key, "openvr_vulkan_instance_extensions", NULL, &type,
-                                    (BYTE *)g_instance_extensions, &len )))
-    {
-        ERR( "Error getting openvr_vulkan_instance_extensions, status %#lx.\n", status );
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-
-    RegCloseKey( vr_key );
-    return TRUE;
-}
-
 static BOOL array_reserve(void **elements, SIZE_T *capacity, SIZE_T count, SIZE_T size)
 {
     SIZE_T max_capacity, new_capacity;
@@ -194,19 +109,13 @@ struct w_iface *create_win_interface( const char *name, struct u_iface u_iface )
     return NULL;
 }
 
-static int load_vrclient( BOOL initializing_registry )
+static int load_vrclient( void )
 {
     struct vrclient_init_params params = {.winevulkan = LoadLibraryW( L"winevulkan.dll" )};
     WCHAR pathW[PATH_MAX];
     DWORD sz;
 
     if (vrclient_loaded) return 1;
-
-    if (!(initializing_registry || get_vulkan_extensions_from_registry()))
-    {
-        TRACE( "Error getting extensions from registry.\n" );
-        return 0;
-    }
 
     /* PROTON_VR_RUNTIME is provided by the proton setup script */
     if(!GetEnvironmentVariableW(L"PROTON_VR_RUNTIME", pathW, ARRAY_SIZE(pathW)))
@@ -267,7 +176,7 @@ void *CDECL HmdSystemFactory(const char *name, int *return_code)
 {
     struct vrclient_HmdSystemFactory_params params = {.name = name, .return_code = return_code};
     TRACE("name: %s, return_code: %p\n", name, return_code);
-    if (!load_vrclient( FALSE )) return NULL;
+    if (!load_vrclient()) return NULL;
     VRCLIENT_CALL( vrclient_HmdSystemFactory, &params );
     return create_win_interface( name, params._ret );
 }
@@ -276,126 +185,69 @@ void *CDECL VRClientCoreFactory(const char *name, int *return_code)
 {
     struct vrclient_VRClientCoreFactory_params params = {.name = name, .return_code = return_code};
     TRACE("name: %s, return_code: %p\n", name, return_code);
-    if (!load_vrclient( FALSE )) return NULL;
+    if (!load_vrclient()) return NULL;
     VRCLIENT_CALL( vrclient_VRClientCoreFactory, &params );
     return create_win_interface( name, params._ret );
-}
-
-static BOOL set_vr_status( HKEY key, DWORD value )
-{
-    LSTATUS status;
-
-    if ((status = RegSetValueExW( key, L"state", 0, REG_DWORD, (BYTE *)&value, sizeof(value) )))
-    {
-        ERR( "Could not set state value, status %#lx.\n", status );
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static HMODULE vrclient;
-
-static DWORD WINAPI initialize_vr_data( void *arg )
-{
-    struct vrclient_init_registry_params params = {.vr_key = arg};
-    HKEY vr_key = arg;
-    HMODULE openxr;
-
-    VRCLIENT_CALL( vrclient_init_registry, &params );
-
-    if (!params._ret)
-    {
-        ERR( "Failed to initialize VR info.\n" );
-        set_vr_status( vr_key, -1 );
-    }
-    else
-    {
-        if (!(openxr = LoadLibraryW( L"wineopenxr" )))
-            WARN( "Could not load wineopenxr, err %lu.\n", GetLastError() );
-        else
-        {
-            BOOL (CDECL * init)(void);
-
-            if ((init = (void *)GetProcAddress( openxr, "wineopenxr_init_registry" ))) init();
-            else ERR( "Failed to find wineopenxr_init_registry export\n" );
-
-            FreeLibrary( openxr );
-        }
-
-        set_vr_status( vr_key, 1 );
-        WINE_TRACE( "Completed VR info initialization.\n" );
-    }
-
-    RegCloseKey( vr_key );
-
-    FreeLibraryAndExitThread( vrclient, 0 );
 }
 
 BOOL CDECL vrclient_init_registry(void)
 {
     WCHAR pathW[PATH_MAX];
     LSTATUS status;
-    HANDLE thread;
     HKEY vr_key;
     DWORD disp;
 
-    if ((status = RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\VR", 0, NULL,
-                                   REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &vr_key, &disp )))
+    if ((status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Wine\\VR",
+            0,
+            NULL,
+            REG_OPTION_VOLATILE,
+            KEY_ALL_ACCESS,
+            NULL,
+            &vr_key,
+            &disp)))
     {
-        ERR( "Could not create key, status %#lx.\n", status );
+        ERR("Could not create key, status %#lx.\n", status);
         return FALSE;
     }
+
     if (disp != REG_CREATED_NEW_KEY)
     {
-        TRACE( "Already initialized, returning.\n" );
-        RegCloseKey( vr_key );
+        RegCloseKey(vr_key);
         return TRUE;
     }
 
-    if (GetEnvironmentVariableW( L"PROTON_VR_RUNTIME", pathW, ARRAY_SIZE(pathW) ))
+    if (!GetEnvironmentVariableW(
+            L"PROTON_VR_RUNTIME",
+            pathW,
+            ARRAY_SIZE(pathW)))
     {
-        if ((status = RegSetValueExW( vr_key, L"PROTON_VR_RUNTIME", 0, REG_SZ, (BYTE *)pathW,
-                                      (wcslen( pathW ) + 1) * sizeof(*pathW) )))
-        {
-            ERR( "Could not set PROTON_VR_RUNTIME value, status %#lx.\n", status );
-            set_vr_status( vr_key, -1 );
-            RegCloseKey( vr_key );
-            return FALSE;
-        }
-    }
-    else
-    {
-        TRACE( "Linux OpenVR runtime is not available\n" );
-        set_vr_status( vr_key, -1 );
-        RegCloseKey( vr_key );
+        TRACE("Linux OpenVR runtime is not available\n");
+        RegCloseKey(vr_key);
         return FALSE;
     }
 
-    if (!load_vrclient( TRUE ))
+    status = RegSetValueExW(
+        vr_key,
+        L"PROTON_VR_RUNTIME",
+        0,
+        REG_SZ,
+        (BYTE *)pathW,
+        (wcslen(pathW) + 1) * sizeof(*pathW));
+
+    if (status)
     {
-        TRACE( "Failed to load vrclient\n" );
-        set_vr_status( vr_key, -1 );
-        RegCloseKey( vr_key );
+        ERR("Could not set PROTON_VR_RUNTIME, status %#lx.\n",
+            status);
+
+        RegCloseKey(vr_key);
         return FALSE;
     }
 
-    if (!set_vr_status( vr_key, 0 ))
-    {
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
+    RegCloseKey(vr_key);
 
-    GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (void *)initialize_vr_data, &vrclient );
-    if (!(thread = CreateThread( NULL, 0, initialize_vr_data, vr_key, 0, NULL )))
-    {
-        WINE_ERR( "Could not create thread, error %lu.\n", GetLastError() );
-        FreeLibrary( vrclient );
-        RegCloseKey( vr_key );
-        return FALSE;
-    }
-    CloseHandle( thread );
-
-    TRACE( "Initialized OpenVR registry entries\n" );
+    TRACE("Initialized passive VR registry entries.\n");
     return TRUE;
 }
 
