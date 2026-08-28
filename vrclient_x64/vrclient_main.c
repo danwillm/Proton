@@ -299,7 +299,6 @@ static DWORD WINAPI initialize_vr_data( void *arg )
 {
     struct vrclient_init_registry_params params = {.vr_key = arg};
     HKEY vr_key = arg;
-    HMODULE openxr;
 
     VRCLIENT_CALL( vrclient_init_registry, &params );
 
@@ -310,18 +309,6 @@ static DWORD WINAPI initialize_vr_data( void *arg )
     }
     else
     {
-        if (!(openxr = LoadLibraryW( L"wineopenxr" )))
-            WARN( "Could not load wineopenxr, err %lu.\n", GetLastError() );
-        else
-        {
-            BOOL (CDECL * init)(void);
-
-            if ((init = (void *)GetProcAddress( openxr, "wineopenxr_init_registry" ))) init();
-            else ERR( "Failed to find wineopenxr_init_registry export\n" );
-
-            FreeLibrary( openxr );
-        }
-
         set_vr_status( vr_key, 1 );
         WINE_TRACE( "Completed VR info initialization.\n" );
     }

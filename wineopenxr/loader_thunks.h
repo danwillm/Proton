@@ -26,6 +26,7 @@ enum unix_call
 {
     unix_init,
     unix_is_available_instance_function,
+    unix_get_vulkan_required_extensions,
     unix_xrAcquireEnvironmentDepthImageMETA,
     unix_xrAcquireSwapchainImage,
     unix_xrAddTrackableImageDatabaseANDROID,

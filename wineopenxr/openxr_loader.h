@@ -50,6 +50,14 @@ struct is_available_instance_function_openxr_params {
   XrResult ret;
 };
 
+struct get_vulkan_required_extensions_params
+{
+  uint32_t bufferCapacityInput;
+  uint32_t *bufferCountOutput;
+  char *buffer;
+  XrResult result;
+};
+
 typedef struct {
   XrInstance host_instance;
   VkInstance vk_instance;

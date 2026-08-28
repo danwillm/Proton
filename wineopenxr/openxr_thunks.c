@@ -5835,6 +5835,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     init_openxr,
     is_available_instance_function_openxr,
+    get_vulkan_required_extensions_openxr,
     thunk64_xrAcquireEnvironmentDepthImageMETA,
     thunk64_xrAcquireSwapchainImage,
     thunk64_xrAddTrackableImageDatabaseANDROID,

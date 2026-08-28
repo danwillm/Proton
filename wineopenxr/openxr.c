@@ -447,6 +447,40 @@ XrResult wine_xrConvertTimeToWin32PerformanceCounterKHR(XrInstance instance,
   return XR_SUCCESS;
 }
 
+typedef XrResult (XRAPI_PTR *PFN_xrGetVulkanInstanceExtensionsVALVE)(
+  uint32_t bufferCapacityInput,
+  uint32_t *bufferCountOutput,
+  char *buffer);
+
+NTSTATUS get_vulkan_required_extensions_openxr(void *args)
+{
+  struct get_vulkan_required_extensions_params *params = args;
+  PFN_xrGetVulkanInstanceExtensionsVALVE function;
+  PFN_xrVoidFunction void_function;
+  XrResult res;
+
+  res = xrGetInstanceProcAddr(
+      XR_NULL_HANDLE,
+      "xrGetVulkanInstanceExtensionsVALVE",
+      &void_function);
+
+  if (res != XR_SUCCESS)
+  {
+      WARN("Failed to get xrGetVulkanInstanceExtensionsVALVE: %d\n", res);
+      params->result = res;
+      return STATUS_SUCCESS;
+  }
+
+  function = (PFN_xrGetVulkanInstanceExtensionsVALVE)void_function;
+
+  params->result = function(
+      params->bufferCapacityInput,
+      params->bufferCountOutput,
+      params->buffer);
+
+  return STATUS_SUCCESS;
+}
+
 NTSTATUS is_available_instance_function_openxr(void *args)
 {
   struct is_available_instance_function_openxr_params *params = args;
