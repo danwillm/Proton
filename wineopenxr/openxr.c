@@ -454,31 +454,55 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetVulkanInstanceExtensionsVALVE)(
 
 NTSTATUS get_vulkan_required_extensions_openxr(void *args)
 {
-  struct get_vulkan_required_extensions_params *params = args;
-  PFN_xrGetVulkanInstanceExtensionsVALVE function;
-  PFN_xrVoidFunction void_function;
-  XrResult res;
+    struct get_vulkan_required_extensions_params *params = args;
+    PFN_xrGetVulkanInstanceExtensionsVALVE function = NULL;
+    PFN_xrVoidFunction void_function = NULL;
+    XrResult res;
 
-  res = xrGetInstanceProcAddr(
-      XR_NULL_HANDLE,
-      "xrGetVulkanInstanceExtensionsVALVE",
-      &void_function);
+    TRACE("enter, capacity %u, count %p, buffer %p\n",
+          params->bufferCapacityInput,
+          params->bufferCountOutput,
+          params->buffer);
 
-  if (res != XR_SUCCESS)
-  {
-      WARN("Failed to get xrGetVulkanInstanceExtensionsVALVE: %d\n", res);
-      params->result = res;
-      return STATUS_SUCCESS;
-  }
+    TRACE("calling xrGetInstanceProcAddr\n");
 
-  function = (PFN_xrGetVulkanInstanceExtensionsVALVE)void_function;
+    res = xrGetInstanceProcAddr(
+        XR_NULL_HANDLE,
+        "xrGetVulkanInstanceExtensionsVALVE",
+        &void_function);
 
-  params->result = function(
-      params->bufferCapacityInput,
-      params->bufferCountOutput,
-      params->buffer);
+    TRACE("xrGetInstanceProcAddr returned %d, function %p\n",
+          res, void_function);
 
-  return STATUS_SUCCESS;
+    if (res != XR_SUCCESS)
+    {
+        params->result = res;
+        return STATUS_SUCCESS;
+    }
+
+    if (!void_function)
+    {
+        ERR("xrGetInstanceProcAddr succeeded but returned NULL\n");
+        params->result = XR_ERROR_FUNCTION_UNSUPPORTED;
+        return STATUS_SUCCESS;
+    }
+
+    function = (PFN_xrGetVulkanInstanceExtensionsVALVE)void_function;
+
+    TRACE("calling xrGetVulkanInstanceExtensionsVALVE\n");
+
+    res = function(
+        params->bufferCapacityInput,
+        params->bufferCountOutput,
+        params->buffer);
+
+    TRACE("xrGetVulkanInstanceExtensionsVALVE returned %d\n", res);
+
+    if (params->bufferCountOutput)
+        TRACE("buffer count is now %u\n", *params->bufferCountOutput);
+
+    params->result = res;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS is_available_instance_function_openxr(void *args)
