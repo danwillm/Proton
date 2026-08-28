@@ -76,7 +76,7 @@ static XrResult get_vulkan_extensions_valve(void)
   res = params.result;
   if (res != XR_SUCCESS)
   {
-      WARN("xrGetVulkanRequiredExtensionsVALVE failed: %d\n", res);
+      WARN("xrGetVulkanInstanceExtensionsVALVE failed: %d\n", res);
       return res;
   }
 
@@ -130,19 +130,23 @@ static BOOL wine_openxr_unix_init_once(void) {
 
 static XrResult wine_openxr_init_once(void)
 {
-  XrResult res;
-
-  if (g_instance_extensions)
-      return XR_SUCCESS;
-
   if (!wine_openxr_unix_init_once())
       return XR_ERROR_INITIALIZATION_FAILED;
 
-  res = get_vulkan_extensions_valve();
-  if (res != XR_SUCCESS)
-      return res;
-
   return XR_SUCCESS;
+}
+
+static XrResult wine_openxr_init_vulkan_extensions(void)
+{
+    XrResult res;
+
+    if (g_instance_extensions)
+        return XR_SUCCESS;
+
+    if ((res = wine_openxr_init_once()) != XR_SUCCESS)
+        return res;
+
+    return get_vulkan_extensions_valve();
 }
 
 XrResult WINAPI xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *instance) {
@@ -1623,6 +1627,12 @@ XrResult WINAPI __wineopenxr_GetVulkanInstanceExtensions(uint32_t buflen, uint32
   XrResult res;
 
   TRACE("\n");
+
+  if ((res = wine_openxr_init_vulkan_extensions()) != XR_SUCCESS)
+  {
+    TRACE("could not get OpenXR Vulkan requirements: %d\n", res);
+    return res;
+  }
 
   if ((res = wine_openxr_init_once()) != XR_SUCCESS) {
     TRACE("could not initialize openxr: %d\n", res);
